@@ -1,6 +1,6 @@
 k/q mode for emacs.
 
-![screenshot](screenshot.png)
+![screenshot](s.png)
 
 -----
 
