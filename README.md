@@ -11,5 +11,4 @@ q major mode for emacs.
 ### Installation
 
 * `(load "/path/to/q-mode.el")`
-* `(add-to-list 'auto-mode-alist '("\\.q" . q-mode))`
 * `M-x q` to create a q process

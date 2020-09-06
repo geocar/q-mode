@@ -45,6 +45,29 @@
       (if (q-needs-sync-p)
 	  (q-sync)))))
 
+(defun q--whitespace-p ()
+  (and
+   (not (eobp))
+   (let ((c (following-char)))
+     (or (= c 9) (= c 10) (= c 13) (= c 32)))))
+
+
+(defun q-indent-line ()
+  "Indent current line as q."
+  (interactive)
+  (save-excursion
+    (let ((line-move-visual nil))
+      (beginning-of-line)
+      (while (q--whitespace-p)
+	(delete-char 1 nil))
+      (ignore-errors
+	(previous-line)
+	(when (q--whitespace-p)
+	  (next-line)
+	  (format "inserting whitespace")
+	  (beginning-of-line)
+	  (insert " "))))))
+
 (defvar-local q--datachannel-region nil
   "Context saved between two calls to the output filter `q--comm-output-hook'.")
 
@@ -172,11 +195,7 @@
 
 (defun q-beginning-of-statement ()
   (beginning-of-line)
-  (while (and
-	  (not (bobp))
-	  (not (eobp))
-	  (let ((c (following-char)))
-	    (or (= c 9) (= c 10) (= c 13) (= c 32))))
+  (while (and (not (bobp)) (q--whitespace-p))
     (forward-line -1)))
   
 (defun q-next-statement ()
@@ -218,22 +237,25 @@
     (define-key map "\C-c\C-r" 'q-send-region)
     (define-key map "\C-c\C-j" 'q-send-line)
     (define-key map "\C-x\C-e" 'q-send-statement) ;;!
-
-    (define-key map "\t" 'completion-at-point)
+    (define-key map "\t" 'q-indent-line)
     map)
   "Basic mode map for `q`")
 
-(define-derived-mode q-mode fundamental-mode "q"
+(define-derived-mode q-mode prog-mode "q"
   "Major mode for q code (kx.com)
 
 \\<q-mode-map>"
-  nil "q")
+  :group 'q
+  (setq-local comment-start "/")
+  (setq-local comment-start-skip "\\(^\\|[ \t]\\)\\(/+[ \t]*\\)")
+  (setq-local comment-end "")
+  (setq-local indent-line-function 'q-indent-line))
 (add-hook 'q-mode-hook 'q--init-mode)
 
 
 (defvar q-comint-mode-map
   (let ((map (nconc (make-sparse-keymap) comint-mode-map)))
-    (define-key map "\t" 'completion-at-point)
+    (define-key map "\t" 'q-indent-line)
     (define-key map "\C-g" 'q-sync)
     map)
   "Basic mode map for `q`")
@@ -311,3 +333,8 @@
 		(kill-buffer session))
 	      (message "results %s" text)
 	      text)))))))
+
+(provide 'q-mode)
+
+;;;###autoload
+(add-to-list 'auto-mode-alist '("\\.q\\'" . q-mode))
