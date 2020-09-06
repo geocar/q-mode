@@ -1,5 +1,7 @@
 q mode for emacs.
 
+![screenshot](e.png)
+
 ### Quickstart
 
 * `(load "/path/to/kq-mode.el")`

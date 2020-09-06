@@ -238,7 +238,7 @@
     map)
   "Basic mode map for `q`")
 
-(defvar q-prompt-regexp "^[a-z ](?:\\.[^\\)]*)?[ ]?)"
+(defvar q-prompt-regexp "^[a-z ](?:\\.[^\\)]*)?[ ]?\\)+"
   "Prompt pattern for `q`")
 
 (define-derived-mode q-comint-mode comint-mode "q-comint"
