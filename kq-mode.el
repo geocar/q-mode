@@ -1,367 +1,306 @@
-(defvar kq-default-language "k"
-  "Default language for new KQ sessions")
+(require 'comint)
 
-(defvar kq-connection nil)
-(defvar kq-language nil)
+;; q el
+(defvar-local q-buffer nil
+  "Current `q` buffer")
 
-;;
-(defun kq-connections ()
-  (let ((conn nil))
-    (dolist (x (buffer-list))
-      (let ((proc (get-buffer-process x)))
-	(if (and proc (process-get proc 'kq-language))
-	    (setq conn (cons proc conn)))))
-    (nreverse conn)))
+(defvar-local q-sync-timer nil
+  "Sync timer used to reconstruct the prompt if onsolicited messages come out")
 
-(defvar kq-mode-syntax-table nil)
-(let ((table (make-syntax-table)))
-  (dolist (x (string-to-list "!@#$%^&*:,.<>-_+=\\|';/?~"))
-    (modify-syntax-entry x "." table))
-  (modify-syntax-entry ?\` "'" table)
-  (modify-syntax-entry ?\( "()  " table)
-  (modify-syntax-entry ?\) ")(  " table)
-  (modify-syntax-entry ?\[ "(]  " table)
-  (modify-syntax-entry ?\] ")[  " table)
-  (modify-syntax-entry ?\{ "(}  " table)
-  (modify-syntax-entry ?\} "){  " table)
-  (setq kq-mode-syntax-table table))
+(defvar q-default-command "q"
+  "The q command to run by default when creating a q-session")
 
-(defvar kq-mode-map nil)
-(let ((map (make-sparse-keymap)))
-  (define-key map "\C-c\C-c" 'kq-send-region)
-  (define-key map "\C-x\C-e" 'kq-send-region)
-  (setq kq-mode-map map))
+(defvar-local q-command nil
+  "Current `q` command. Default is `q-default-command` not this value.")
 
-(define-derived-mode kq-mode nil "KQ"
-  "Major mode for writing K/Q code
+(defvar-local q--window-height nil
+  "Last recorded window height")
 
-\\{kq-mode-map}"
-  (set (make-local-variable 'kq-connection) (car (kq-connections))) ;last touch
-  (set (make-local-variable 'kq-language) nil)
-  (set-syntax-table kq-mode-syntax-table))
+(defvar-local q--window-width nil
+  "Last recorded window width")
 
+(defcustom q-mode-window-sync-p t
+  "Keep the q window in sync with the emacs window (using the \\c command)"
+  :type '(boolean)
+  :group 'q)
 
-(defvar kq-interactive-mode-map nil)
-(let ((map (make-sparse-keymap)))
-  (define-key map (kbd "<return>") 'kq-interactive-enter)
-  (define-key map "\C-a" 'kq-interactive-start)
-  (setq kq-interactive-mode-map map))
-
-(define-derived-mode kq-interactive-mode nil "KQ"
-  "Major mode for interacting with a KDB server
-
-\\{kq-interactive-mode-map}"
-  (set-syntax-table kq-mode-syntax-table))
-
-(defun kq-ipc-raw-integer (integer)
-  "Encode an integer in little-endian"
-  (unibyte-string
-   (logand (lsh integer 0) 255)
-   (logand (lsh integer -8) 255)
-   (logand (lsh integer -16) 255)
-   (logand (lsh integer -24) 255)))
-
-(defun kq-ipc-string (string)
-  (setq string (format "%s" string))
-  (concat "\n\0"
-	  (kq-ipc-raw-integer (string-bytes string))
-	  (string-to-unibyte string)))
-
-(defun kq-ipc-symbol (symbol)
-  (setq symbol (format "%s" symbol))
-  (concat "\xf5" (string-to-unibyte symbol) "\0"))
-
-(defun kq-ipc-integer (integer)
-  (concat "\xf9" (kq-ipc-raw-integer integer) "\0\0\0\0")) ; 32-bit only
-
-(defun kq-ipc-list (count encoded)
-  (concat "\0\0"  (kq-ipc-raw-integer count) encoded))
-
-(defun kq-ipc-message (message-type encoded)
+(defun q--session-script (command)
+  ;; this "looks this way" to support tramp.
   (concat
-   "\1"
-   (unibyte-string message-type)
-   "\0\0"
-   (kq-ipc-raw-integer (+ 8 (string-bytes encoded)))
-   encoded))
+   "export QHOME=\"${QHOME:-$HOME/q}\";export QLIC=\"${QLIC:-$QHOME}\";export PATH=\"$PATH:$QHOME/l64:$QHOME/l32\";[ -f \"$HOME/.bash_profile\" ]&&source \"$HOME/.bash_profile\";"
+   command))
 
-;;
-(defun kq-send (code)
-  (cond
-   ((null kq-connection)
-    (let ((x (kq-connections)))
-      (cond
-       ((null x) (call-interactively 'kq-connect))
-       ((null (cdr x)) (setq kq-connection (car x)) (kq-send code))
-       (t (error "todo")))))
-   (t
-    (let* ((lang (or kq-language
-		     (let ((ext (file-name-extension (buffer-name))))
-		       (if (or (string= ext "q") (string= ext "k")) ext nil))
-		     (process-get kq-connection 'kq-language)))
-	   (message (kq-ipc-list 3 (concat
-				    (kq-ipc-string (kq-language-interp lang))
-				    (kq-ipc-string (format "%s)%s" lang code))
-				    (kq-ipc-integer 0)))))
-      (process-send-string kq-connection (kq-ipc-message 0 message))))))
+(defun q--session-comint (procname command)
+  (let ((buffer nil))
+    (save-window-excursion
+      (setq buffer (make-comint-in-buffer procname procname "/bin/bash" nil "-c" (q--session-script command))))
+    buffer))   
 
-(defun kq-current-statement ()
+(defvar q-session-history nil)
+
+(defun q-check-sync (buffer)
+  (with-current-buffer buffer
+    (setq q-sync-timer nil)
+    (ignore-errors 
+      (if (q-needs-sync-p)
+	  (q-sync)))))
+
+(defvar-local q--datachannel-region nil
+  "Context saved between two calls to the output filter `q--comm-output-hook'.")
+
+(defun q--comm-output-hook (&optional string)
+  (if q-sync-timer (cancel-timer q-sync-timer))
+  (setq q-sync-timer (run-at-time "1 sec" nil 'q-check-sync (current-buffer)))
+  (let ((begin (or comint-last-output-start (point-min-marker)))
+	(end (process-mark (get-buffer-process (current-buffer)))))
+    (let ((start-marker (or q--datachannel-region (copy-marker begin)))
+	  (end-marker (copy-marker end)))
+      (save-excursion
+	(goto-char start-marker)
+	(while (re-search-forward "\e]1337;File=[^:]*:[ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/]*=*[\000-\037]" end-marker t)
+	  (let ((text (buffer-substring-no-properties (match-beginning 0) (point))))
+	    (replace-match "")
+	    (message ".")
+	    (setq text (substring text 0 (- (length text) 1)))
+	    (let ((image (base64-decode-string (nth 1 (split-string text ":")))))
+	      (insert-image (create-image image nil t)))))
+	(if (re-search-forward "[\000-\037]" end-marker t)
+	    (progn
+	      (backward-char)
+	      (setq q--datachannel-region (point)))
+	  (setq q--datachannel-region nil))))))
+
+(defun q--comm-input-hook (string)
+  (let ((h (window-body-height))
+	(w (window-body-width)))
+    (if (or (not q-mode-window-sync-p)
+	    (string= (substring string 0 1) "\\")
+	    (and (eq q--window-height h) (eq q--window-width w)))
+	string
+      (comint-simple-send (get-buffer-process (current-buffer))
+			  (format "\\c %d %d" h w))
+      (setq q--window-height h
+	    q--window-width w)
+      string)))
+
+(defun q--init-comint-mode ()
+  (add-hook 'comint-dynamic-complete-functions 'q--comm-complete) 
+  (add-hook 'comint-input-filter-functions 'q--comm-input-hook)
+  (make-variable-buffer-local 'q--datachannel-region)
+  (add-hook 'comint-output-filter-functions 'q--comm-output-hook))
+
+(defun q-needs-sync-p ()
   (save-excursion
-    (beginning-of-line)
-    (while (and
-	    (not (bobp))
-	    (not (eobp))
-	    (let ((c (following-char)))
-	      (or (= c 9) (= c 10) (= c 13) (= c 32))))
-      (forward-line -1))
-    (let ((start (point)) c q esc (ws t) (brace 0) (bracket 0) (paren 0) result)
-      (while (and (not result) (not (eobp)))
-	(setq c (following-char))
-	(cond
-	 (esc (setq esc nil))
-	 (q (cond
-	     ((= c 92) (setq esc t)) ;backslash
-	     ((= c ?\") (setq q nil))))
-	 ((and ws (= c ?\/) (end-of-line)))
-	 ((or (= c 32) (= c 9))  (setq ws t))
-	 ((or (= c 10) (= c 13))
-	  (if (and (= 0 bracket brace paren) (not q))
-	      (setq result (buffer-substring-no-properties start (point)))))
-	 (t
-	  (setq ws nil)
-	  (cond
-	   ((= c ?\") (setq q t))
-	   ((= c ?\[) (setq bracket (1+ bracket)))
-	   ((= c ?\]) (setq bracket (1- bracket)))
-	   ((= c ?\() (setq paren (1+ paren)))
-	   ((= c ?\)) (setq paren (1- paren)))
-	   ((= c ?\{) (setq brace (1+ brace)))
-	   ((= c ?\}) (setq brace (1- brace))))))
-	(forward-char 1))
-      (when (not result)
-	(setq result (buffer-substring-no-properties start (point))))
-      result)))
-	 
-(defun kq-send-region (mark point)
+    (end-of-buffer)
+    (backward-char 1)
+    (eq 'fence (get-text-property (point) 'read-only))))
+
+(defun q-session (command &optional session)
+  (interactive (list (read-string (format "q workspace command: " q-default-command) q-default-command 'q-session-history q-default-command)))
+  (if (null session)
+      (setq session "")
+    (setq session (format "(%s)" session)))
+  (let ((orig-command command))
+    (if (and command q-command (not (string= q-command command)))
+	(setq q-buffer nil))
+    (if command
+	(setq q-command command)
+      (setq command (or q-command q-default-command))) ; always prefer buffer version
+    (if q-buffer
+	q-buffer
+      (let ((procname (format "q%s %s: exec %s" session default-directory command)))
+	(if (comint-check-proc procname)
+	    (get-buffer procname)
+	  (let ((new-buffer (q--session-comint procname command)))
+	    (with-current-buffer new-buffer (q-comint-mode))
+	    (when orig-command
+	      (split-window-sensibly)
+	      (switch-to-buffer-other-window new-buffer))
+	    new-buffer))))))
+
+(defun q--hex-encode (before text after)
+  (let ((res (list (concat before "10h$0x"))))
+    (dotimes (i (length text) (apply #'concat (reverse (cons after res))))
+      (push (format "%02x" (string-to-char (substring text i (+ i 1)))) res))))
+
+(defun q--encode (text)    
+  (if (string-match "[\000-\017\177-\377]" text)
+      (q--hex-encode "value[" text "]")
+    text))
+
+(defun q-sync ()
+  (interactive)
+  (with-current-buffer (q-session nil)
+    (comint-simple-send (get-buffer-process (current-buffer)) "")
+    (goto-char (point-max))
+    (insert-before-markers "\n")))
+
+(defun q-send-string (text)
+  (with-current-buffer (q-session nil)
+    (goto-char (point-max))
+    (insert-before-markers (concat text "\n"))
+    (comint-simple-send (get-buffer-process (current-buffer)) (q--encode text))))
+
+(defun q-send-region (start end)
+  "Send the region between START and END to the inferior q[con] process."
   (interactive "r")
-  (kq-send
-   (if (use-region-p) (buffer-substring-no-properties mark point)
-     (save-excursion (goto-char point) (kq-current-statement)))))
+  (save-excursion
+    (save-restriction 
+      (narrow-to-region start end)
+      (goto-char (point-min))
+      (let ((sending t))
+	(while (not (eobp))
+	  (let ((statement (q-current-statement)))
+	    (if (and sending (string= statement "\\"))
+		(setq sending nil)
+	      (if (and (not sending) (string= statement "/"))
+		  (setq sending t)
+		(if sending
+		    (q-send-string statement)))))
+	  (q-next-statement)))
+      (widen))))
 
-
-;;
-(defun kq-connect (port &optional hostname username password)
-  (interactive "NPort: ")
-  (if (null hostname) (setq hostname "127.0.0.1"))
-  (let* ((name (format "kq`:%s:%d" hostname port))
-         (buffer (get-buffer-create name))
-	 (proc (make-network-process
-		:name     name
-		:host     hostname
-		:service  port
-		:nowait   t
-		:buffer   buffer
-		:coding   '(no-conversion . no-conversion)
-		:filter   'kq-process-filter
-		:sentinel 'kq-process-sentinel)))
-    (with-current-buffer buffer
-      (kq-interactive-mode)
-      (setq buffer-read-only nil))
-    (process-put proc 'buffer buffer)
-    (process-put proc 'phase 'login)
-    (process-put proc 'points (make-hash-table))
-    (process-put proc 'neednl (make-hash-table))
-    (process-put proc 'npoint 0)
-    (process-put proc 'inq "")
-    (process-put proc 'outq nil)
-    (process-put proc 'kq-language kq-default-language)
-    (switch-to-buffer buffer)
-    (if (or username password)
-        (process-put proc 'login
-                     (format "%s:%s"
-                             (or username "")
-                             (or password ""))))
-    proc))
-
-(defun kq-read-int (string n)
-  (logior (elt string (+ n 0))
-	  (lsh (elt string (+ n 1)) 8)
-	  (lsh (elt string (+ n 2)) 16)
-	  (lsh (elt string (+ n 3)) 24)))
-
-(defun kq-update-output-spot (proc slot buffer position)
-  (puthash slot (vector buffer position) (process-get proc 'points)))
-(defun kq-output-spot (proc slot)
-  (gethash slot (process-get proc 'points)))
-(defun kq-output-spot-buffer (spot)
-  (elt spot 0))
-(defun kq-output-spot-position (spot)
-  (elt spot 1))
-
-(defun kq-insert-readonly (text)
-  (let ((here (point))
-	(inhibit-read-only t))
-    (insert text)
-    (add-text-properties here (point) '(read-only t rear-nonsticky (read-only)))))
-
-(defun kq-process-slot (proc slot fun)
-  (with-current-buffer (process-buffer proc)
-    (save-excursion
-      (let ((spot (kq-output-spot proc slot))
-	    (inhibit-read-only t))
-	(with-current-buffer (kq-output-spot-buffer spot)
-	  (goto-char (kq-output-spot-position spot))
-	  (funcall fun)
-	  (kq-update-output-spot proc slot (current-buffer) (point)))))))
-
-(defun kq-process-image (proc slot text)
-  (kq-process-slot proc slot
-		   (lambda ()
-		     (let ((start (point)))
-		       (insert "\n")
-		       (insert-image (create-image text nil t))
-		       (add-text-properties start (point)
-					    '(read-only t rear-nonsticky (read-only)))))))
-
-
-(defun kq-process-string (proc slot text)
-  (cond
-   ((= 0 slot)
-    (message text))
-   ((string= "" text)
-    t)
-   (t
-    (let ((neednl (string= (substring text -1) "\n"))
-	  (table (process-get proc 'neednl)))
-      (if neednl (setq text (substring text 0 -1)))
-      (kq-process-slot proc slot
-		       (lambda ()
-			 (if (gethash slot table)
-			     (setq text (concat "\n" text)))
-			 (kq-insert-readonly text)
-			 (puthash slot neednl table)))))))
-
-(defun kq-process-input (proc message)
-  (let ((type (elt message 8)))
-    (cond
-     ;((= type 246) (kq-process-string proc 0 (char-to-string (elt message 9))))
-     ((= type 10)  (kq-process-string proc 0 (substring message 14))) ;; framed
-     ((and (= type 0) (= (elt message 10) 2) (= (elt message 23) 10)) ;; (n; text)
-      (kq-process-string proc (kq-read-int message 15) (substring message 29)))
-     ((and (= type 0) (= (elt message 10) 2) (= (elt message 23) 4)) ;; (n; 0ximg)
-      (kq-process-image proc (kq-read-int message 15) (substring message 29)))
-     (t (error "unsupported kdb parse")))))	  
-
-(defun kq-process-filter (proc input)
-  (setq input (concat (process-get proc 'inq) input))
-  (process-put proc 'inq "")
-  (let ((n nil)
-	(inhibit-read-only t))
-    (cond
-     ((eq 'login (process-get proc 'phase))
-      (process-put proc 'phase 'waiting)
-      (cond
-       ((and (<= 1 (length input)) (= (elt input 0) 0))
-	(kq-insert-prompt proc)
-	(kq-process-filter proc (substring input 1)))
-       (t
-	(let ((q  (process-get proc 'outq))
-	      (nq (kq-connect (process-contact proc :service)
-			      (process-contact proc :remote)
-			      (read-from-minibuffer "kdb username: ")
-			      (read-passwd "password: "))))
-	  (if q (process-put nq 'outq q))))))
-     ((or (> 8 (length input))
-	  (> (setq n (kq-read-int (substring input 4 8) 0)) (length input))) ;;setq n
-      (process-put proc 'phase 'more)
-      (process-put proc 'inq input))
-     (t
-      (kq-process-input proc (substring input 0 n))
-      (kq-process-filter proc (substring input n))))))
-
-(defun kq-process-sentinel (proc event)
-  (cond
-   ((string= event "open\n")
-    (let ((auth (process-get proc 'login)))
-      (process-put proc 'login nil)
-      (process-send-string proc (concat (string-to-unibyte (or auth "anonymous")) "\0"))))
-   (t
-    (princ (replace-regexp-in-string "\n$" "" (format "kq %s" event))))))
-
-(defun kq-insert-prompt (proc)
-  (with-current-buffer (process-buffer proc)
-    (let ((inhibit-read-only t))
-      (goto-char (point-max))
-      (let ((p (point))
-	    (n (process-get proc 'npoint)))
-	(setq n (+ n 1))
-	(process-put proc 'npoint n)
-	(insert (kq-language-prompt proc))
-	(add-text-properties p (point)
-			     (list
-			      'read-only t
-			      'rear-nonsticky '(read-only)
-			      'kq-spot n
-			      'kq-language (process-get proc 'kq-language)))))))
-
-(defun kq-interactive-clear ()
+(defun q-send-line ()
+  "Send the current line to the inferior q[con] process."
   (interactive)
-  (kill-region (kq-interactive-start) (point-max)))
+  (q-send-string (buffer-substring (point-at-bol) (point-at-eol))))
 
-(defun kq-interactive-start ()
+(defun q-send-buffer ()
+  "Load current buffer into the inferior q[con] process."
   (interactive)
-  (let ((slot (get-pos-property (point) 'kq-spot))
-	(here (point)))
-    (while (and
-	    (< 1 (point))
-	    (eql slot (get-pos-property (point) 'kq-spot)))
-      (setq here (point))
-      (backward-char 1))
-    (goto-char here)
-    (forward-char 1)
-    (point)))
+  (q-send-region (point-min) (point-max)))
 
-(defun kq-interactive-enter ()
+(defun q-beginning-of-statement ()
+  (beginning-of-line)
+  (while (and
+	  (not (bobp))
+	  (not (eobp))
+	  (let ((c (following-char)))
+	    (or (= c 9) (= c 10) (= c 13) (= c 32))))
+    (forward-line -1)))
+  
+(defun q-next-statement ()
+  (let ((end (re-search-forward "\n[^ \t]" nil t 1)))
+    (let ((p (if end (- end 1) (point-max))))
+      (goto-char p)
+      p)))
+
+(defun q-end-of-statement ()
+  (q-next-statement)
+  (while (and (not (bobp))
+	      (let ((c (preceding-char)))
+		(or (= c 9) (= c 10) (= c 13) (= c 32))))
+    (backward-char)))
+
+(defun q-current-statement ()
+  (save-excursion
+    (q-beginning-of-statement)
+    (let ((start (point)))
+      (q-end-of-statement)
+      (buffer-substring-no-properties start (point)))))
+
+(defun q-send-statement ()
+  "Send the current function/definition to the inferior q[con] process."
   (interactive)
-  (let ((proc (get-buffer-process (current-buffer)))
-	(language (get-pos-property (point) 'kq-language))
-	(start    (save-excursion (kq-interactive-start)))
-	(end      (save-excursion (end-of-line) (point)))
-	(slot     (get-pos-property (point) 'kq-spot)))
-    (let ((text   (buffer-substring-no-properties start end))) ; length of prompt
-      (cond
-       ((kq-output-spot proc slot) ;copy
-	(goto-char (point-max))
-	(kq-interactive-clear)
-	(insert-and-inherit text))
-       ((string= text "")
-	(kq-insert-readonly "\n") ;ignore, but allow newlines because they look nice.
-	(kq-insert-prompt proc))
-       (t
-	(let ((interp (kq-ipc-string (kq-language-interp proc)))
-	      (inhibit-read-only t)
-	      (code   (kq-ipc-string (format "%s)%s" language text))))
-	  (goto-char end)
-	  (kq-update-output-spot proc slot (current-buffer) (point))
-	  (puthash slot t (process-get proc 'neednl))
-	  (insert "\n")
-	  (add-text-properties start (point)
-			       '(read-only t rear-nonsticky (read-only)))
-	  (if (string= "\\" text)
-	      (process-put proc 'kq-language (if (string= "k" (process-get proc 'kq-language)) "q" "k"))
-	    (process-send-string proc (kq-ipc-message 0 (kq-ipc-list 3 (concat interp code (kq-ipc-integer slot))))))
-	  (kq-insert-prompt proc)))))))	
+  (q-send-string (q-current-statement)))
 
-(defun kq-language-format (proc)
-  (if (processp proc) (setq proc (process-get proc 'kq-language)))
-  (if (string= "k" proc) "-3!" ".Q.s@"))
-(defun kq-language-interp (proc)
-  (concat
-   "k){a:.q.show;.z.slot::y;.q.show::{y@(z;.Q.s x);}[;-.z.w;y];.:\"\\\\c "
-   (format "%d %d" (window-body-height) (window-body-width))
-   "\";@[{x:.:x;y@(z;$[101h=@x;\"\";"
-   (kq-language-format proc)
-   "x])}[;-.z.w;y];x;{y@(z;\"'\",x,\"\\n\")}[;-.z.w;y]];.q.show::a;}"))
-(defun kq-language-prompt (proc)
-  (let ((lang (process-get proc 'kq-language)))
-    (if (string= "k" lang) "  " (format "%s)" lang))))
+
+(defun q--init-mode ()
+  t)
+
+(defvar q-mode-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map "\C-c\C-c" 'q-send-statement)
+    (define-key map "\C-\M-x"  'q-send-statement)
+    (define-key map "\C-c\C-k" 'q-send-buffer)
+    (define-key map "\C-c\M-k" 'q-send-buffer)
+    (define-key map "\C-c\C-l" 'q-send-buffer)
+    (define-key map "\C-c\C-r" 'q-send-region)
+    (define-key map "\C-c\C-j" 'q-send-line)
+    (define-key map "\C-x\C-e" 'q-send-statement) ;;!
+
+    (define-key map "\t" 'completion-at-point)
+    map)
+  "Basic mode map for `q`")
+
+(define-derived-mode q-mode fundamental-mode "q"
+  "Major mode for q code (kx.com)
+
+\\<q-mode-map>"
+  nil "q")
+(add-hook 'q-mode-hook 'q--init-mode)
+
+
+(defvar q-comint-mode-map
+  (let ((map (nconc (make-sparse-keymap) comint-mode-map)))
+    (define-key map "\t" 'completion-at-point)
+    (define-key map "\C-g" 'q-sync)
+    map)
+  "Basic mode map for `q`")
+
+(defvar q-prompt-regexp "^[a-z ](?:\\.[^\\)]*)?[ ]?)"
+  "Prompt pattern for `q`")
+
+(define-derived-mode q-comint-mode comint-mode "q-comint"
+  "Major mode for q interactive sessions (kx.com)
+
+\\<q-comint-mode-map>"
+  nil "q-comint"
+  (setq comint-prompt-regexp q-prompt-regexp)
+  (setq comint-prompt-read-only t)
+  (setq q-buffer (current-buffer))
+  (set (make-local-variable 'paragraph-start) q-prompt-regexp))
+(add-hook 'q-comint-mode-hook 'q--init-comint-mode)
+  
+(defun q (&optional dir)
+  (interactive)
+  (if (eq major-mode 'fundamental-mode) (q-mode))
+  (let ((default-directory (or dir default-directory)))
+    (command-execute 'q-session)))
+
+
+
+
+(defun org-babel-execute:q (body params)
+  (setq params (org-babel-process-params params))
+  (let (temporary
+	(sid (assq :session params))
+	(cmd (assq :command params))
+	(rt  (assq :result-type params))
+	(dir (assq :dir params)))
+    (let ((default-directory (if dir (cdr dir) default-directory))
+	  (result-type (if (consp rt) (cdr rt) 'value)))
+      (let ((session (q-session (if cmd (cdr cmd) "q")
+				(if (and (consp sid) (not (string= "none" (cdr sid))))
+				    (format "%s" (cdr sid))
+				  (setq temporary (format "%s" (md5 body)))
+				  temporary))))
+	(save-excursion
+	  (with-current-buffer session
+	    (let (start end text (proc (get-buffer-process session)))
+	      (setq start (copy-marker (process-mark proc)))
+	      (goto-char start)
+	      (backward-char)
+	      (dolist (x params)
+		(if (eq :var (car x))
+		    (setq body (concat (format "%s:%s;" (cadr x) (cddr x)) body))))
+	      (if (eq result-type 'output)
+		  (setq body (concat "-1\"\\033]1337;BeginQ\\007\";" body))
+		(setq body (concat "{-1\"\\033]1337;BeginQ\\007\";show x}[{" body "}[]];")))
+	      (setq body (concat body ";-1\"\\033]1337;EndQ\\007\";"))
+	      (comint-simple-send proc (q--encode body))
+	      (while (not (re-search-forward "\033]1337;EndQ\007" nil t))
+		(accept-process-output proc)
+		(goto-char start))
+	      (replace-match "")
+	      (setq end (copy-marker (point-marker)))
+	      (re-search-backward "\033]1337;BeginQ\007")
+	      (replace-match "")
+	      (message "okay about to get text between %s and %s" (point) end)
+	      (setq text (buffer-substring-no-properties (point) end))
+	      (message "we have %s" text)
+	      (delete-region (point) end)
+	      (when temporary
+		(kill-process proc)
+		(kill-buffer session))
+	      text)))))))
