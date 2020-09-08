@@ -56,15 +56,17 @@
   "Indent current line as q."
   (interactive)
   (save-excursion
-    (let ((line-move-visual nil))
-      (beginning-of-line)
+    (let ((line-move-visual nil) first-line-p)
+      (setq first-line-p (=
+			  (progn (beginning-of-line) (format "a %s" (point)) (point))
+			  (save-excursion (q-beginning-of-statement)
+					  (format "b %s" (point))
+					  (point))))
+      (message "first line %s" first-line-p)
       (while (q--whitespace-p)
 	(delete-char 1 nil))
-      (ignore-errors
-	(previous-line)
-	(when (q--whitespace-p)
-	  (next-line)
-	  (format "inserting whitespace")
+      (if (not first-line-p)
+	(ignore-errors
 	  (beginning-of-line)
 	  (insert " "))))))
 
@@ -225,6 +227,8 @@
 
 
 (defun q--init-mode ()
+  (setq-local indent-line-function 'q-indent-line)
+  (electric-indent-local-mode -1)
   t)
 
 (defvar q-mode-map
@@ -260,7 +264,7 @@
     map)
   "Basic mode map for `q`")
 
-(defvar q-prompt-regexp "^[a-z ](?:\\.[^\\)]*)?[ ]?\\)+"
+(defvar q-prompt-regexp "^[a-z ](?:\\.[^)]*)?[ ]?)+"
   "Prompt pattern for `q`")
 
 (define-derived-mode q-comint-mode comint-mode "q-comint"
