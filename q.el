@@ -80,7 +80,7 @@
 
 (defun q--comm-output-hook (&optional string)
   (if q-sync-timer (cancel-timer q-sync-timer))
-  (setq q-sync-timer (run-at-time "1 sec" nil 'q-check-sync (current-buffer)))
+  (setq q-sync-timer (run-at-time "0.1 sec" nil 'q-check-sync (current-buffer)))
   (let ((begin (or comint-last-output-start (point-min-marker)))
 	(end (process-mark (get-buffer-process (current-buffer)))))
     (let ((start-marker (or q--datachannel-region (copy-marker begin)))
