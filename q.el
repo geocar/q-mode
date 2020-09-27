@@ -33,8 +33,13 @@
 (defun q--session-comint (procname command)
   (let ((buffer nil))
     (save-window-excursion
-      (setq buffer (make-comint-in-buffer procname procname "/bin/bash" nil "-c" (q--session-script command))))
-    buffer))   
+      (setq buffer
+	    (cond
+	     ((and (not (file-remote-p default-directory)) (string-equal system-type "windows-nt"))
+	      (make-comint-in-buffer procname procname "cmd" nil "/c" command))
+	     (t
+	      (make-comint-in-buffer procname procname "/bin/bash" nil "-c" (q--session-script command))))))
+    buffer))
 
 (defvar q-session-history nil)
 
