@@ -161,7 +161,7 @@
 (defun q-sync ()
   (interactive)
   (with-current-buffer (q-session nil)
-    (comint-simple-send (get-buffer-process (current-buffer)) "")
+    (comint-simple-send (get-buffer-process (current-buffer)) "$[.z.q;1\"q\",{$[x=`.;\"\";string x]}[system\"d\"],\")\";::];")
     (goto-char (point-max))
     (insert-before-markers "\n")))
 
